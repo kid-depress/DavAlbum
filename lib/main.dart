@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui'; // 用于磨砂效果
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -10,7 +12,18 @@ import 'db_helper.dart';
 import 'webdav_service.dart';
 import 'photo_view_page.dart';
 
-void main() => runApp(const MaterialApp(home: SuperBackupPage()));
+void main() {
+  // 设置状态栏透明
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.dark,
+  ));
+  runApp(const MaterialApp(
+    debugShowCheckedModeBanner: false,
+    themeMode: ThemeMode.light,
+    home: SuperBackupPage(),
+  ));
+}
 
 class SuperBackupPage extends StatefulWidget {
   const SuperBackupPage({super.key});
@@ -22,12 +35,14 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
   final _urlCtrl = TextEditingController();
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
-  String log = "等待操作...";
+  
+  // 日志列表，用于在设置页显示
+  List<String> _logs = [];
   bool isRunning = false;
   
-  List<PhotoItem> _displayItems = []; 
-  int _crossAxisCount = 3; // 当前列数
-  int _startColCount = 3;  // 记录缩放开始时的列数
+  Map<String, List<PhotoItem>> _groupedItems = {}; 
+  int _crossAxisCount = 3; 
+  int _startColCount = 3; 
 
   @override
   void initState() {
@@ -52,13 +67,20 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     await prefs.setString('pass', _passCtrl.text);
   }
 
-  void addLog(String m) => setState(() => log += "\n$m");
+  void addLog(String m) {
+    // 只保留最近 50 条日志
+    setState(() {
+      _logs.insert(0, m); 
+      if (_logs.length > 50) _logs.removeLast();
+    });
+  }
 
+  // --- 核心业务逻辑 (保持不变) ---
   Future<void> _refreshGallery() async {
     final albums = await PhotoManager.getAssetPathList(type: RequestType.image);
     List<AssetEntity> localAssets = [];
     if (albums.isNotEmpty) {
-      localAssets = await albums.first.getAssetListPaged(page: 0, size: 100);
+      localAssets = await albums.first.getAssetListPaged(page: 0, size: 500);
     }
 
     final dbRecords = await DbHelper.getAllRecords();
@@ -89,25 +111,83 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
 
     var list = mergedMap.values.toList();
     list.sort((a, b) => b.createTime.compareTo(a.createTime));
+
+    Map<String, List<PhotoItem>> groups = {};
+    for (var item in list) {
+      DateTime date = DateTime.fromMillisecondsSinceEpoch(item.createTime);
+      String key = "${date.year}年${date.month}月"; 
+      if (!groups.containsKey(key)) groups[key] = [];
+      groups[key]!.add(item);
+    }
     
-    if (mounted) setState(() => _displayItems = list);
+    if (mounted) setState(() => _groupedItems = groups);
+  }
+
+  Future<void> _clearCache() async {
+    try {
+      final appDir = await getTemporaryDirectory();
+      int count = 0;
+      if (appDir.existsSync()) {
+        appDir.listSync().forEach((FileSystemEntity entity) {
+          if (entity is File && p.basename(entity.path).startsWith('temp_')) {
+            entity.deleteSync();
+            count++;
+          }
+        });
+      }
+      addLog("🧹 已清理 $count 个缓存文件");
+    } catch (e) {
+      addLog("❌ 清理失败: $e");
+    }
+  }
+
+  Future<void> _syncDatabase({bool isRestore = false}) async {
+    if (isRunning) return;
+    setState(() => isRunning = true);
+    addLog(isRestore ? "📥 正在恢复数据库..." : "📤 正在备份数据库...");
+    
+    try {
+      final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
+      await service.ensureFolder("MyPhotos/");
+      final dbPath = await DbHelper.getDbPath();
+      
+      if (isRestore) {
+        await DbHelper.close(); 
+        await service.downloadFile("MyPhotos/backup_records.db", dbPath);
+        addLog("✅ 数据库恢复成功！");
+        await _refreshGallery(); 
+      } else {
+        if (File(dbPath).existsSync()) {
+          await service.upload(File(dbPath), "MyPhotos/backup_records.db");
+          addLog("✅ 数据库备份成功！");
+        }
+      }
+    } catch (e) {
+      addLog("❌ 操作失败: $e");
+    } finally {
+      setState(() => isRunning = false);
+    }
   }
 
   Future<void> doBackup() async {
     if (isRunning) return;
-    setState(() { isRunning = true; log = "🚀 开始备份..."; });
+    setState(() => isRunning = true);
+    addLog("🚀 开始备份...");
     await _saveConfig();
 
     try {
       final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
-      if (!(await Permission.photos.request().isGranted)) return addLog("❌ 无相册权限");
+      if (!(await Permission.photos.request().isGranted)) {
+         addLog("❌ 无相册权限");
+         return;
+      }
 
       await service.ensureFolder("MyPhotos/");
       await service.ensureFolder("MyPhotos/.thumbs/");
 
       final albums = await PhotoManager.getAssetPathList(type: RequestType.image);
       if (albums.isNotEmpty) {
-        final photos = await albums.first.getAssetListPaged(page: 0, size: 50);
+        final photos = await albums.first.getAssetListPaged(page: 0, size: 50); // 每次50张
         final appDir = await getApplicationDocumentsDirectory();
         int count = 0;
 
@@ -118,13 +198,14 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
           if (file == null) continue;
 
           String fileName = p.basename(file.path);
-          addLog("正在传: $fileName");
+          
+          // 更新UI提示，不刷屏
+          // addLog("正在传: $fileName"); 
 
           await service.upload(file, "MyPhotos/$fileName");
 
           final thumbData = await asset.thumbnailDataWithSize(const ThumbnailSize(200, 200));
           String? localPath;
-          
           if (thumbData != null) {
             await service.uploadBytes(thumbData, "MyPhotos/.thumbs/$fileName");
             final thumbFile = File('${appDir.path}/thumb_${asset.id}.jpg');
@@ -138,147 +219,304 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
             time: asset.createDateTime.millisecondsSinceEpoch,
             filename: fileName
           );
-          
           count++;
-          await _refreshGallery(); 
+          // 局部刷新太频繁会卡顿，建议每几张刷新一次
+          if (count % 5 == 0) await _refreshGallery(); 
         }
-        addLog("✅ 完成！新增 $count 张");
+        addLog("✅ 备份完成：新增 $count 张");
+        
+        final dbFile = File(await DbHelper.getDbPath());
+        await service.upload(dbFile, "MyPhotos/backup_records.db");
+        addLog("☁️ 数据库已同步");
       }
     } catch (e) {
       addLog("❌ 失败: $e");
     } finally {
       setState(() => isRunning = false);
+      _refreshGallery(); // 最后刷新一次
     }
   }
 
-  Future<void> syncFromCloud() async {
-    if (isRunning) return;
-    setState(() { isRunning = true; log = "🔍 拉取云端数据..."; });
-    try {
-      final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
-      final remoteFiles = await service.listFiles("MyPhotos/");
-      final appDir = await getApplicationDocumentsDirectory();
-      int syncCount = 0;
+  // --- UI 构建 ---
 
-      for (var remotePath in remoteFiles) {
-        String fileName = p.basename(remotePath); 
-        String assetId = fileName; 
+  // 显示设置面板 (Bottom Sheet)
+  void _showSettingsPanel() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true, // 允许全屏
+      backgroundColor: Colors.transparent,
+      builder: (context) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        minChildSize: 0.4,
+        maxChildSize: 0.95,
+        builder: (_, controller) => Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          padding: const EdgeInsets.all(20),
+          child: ListView(
+            controller: controller,
+            children: [
+              Center(child: Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2)))),
+              const SizedBox(height: 20),
+              const Text("服务器配置", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 15),
+              _buildTextField(_urlCtrl, "WebDAV 地址", Icons.link),
+              const SizedBox(height: 10),
+              _buildTextField(_userCtrl, "用户名", Icons.person),
+              const SizedBox(height: 10),
+              _buildTextField(_passCtrl, "密码", Icons.lock, isObscure: true),
+              const SizedBox(height: 20),
+              const Text("高级功能", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _buildActionButton(Icons.restore, "恢复数据", Colors.orange, () => _syncDatabase(isRestore: true)),
+                  _buildActionButton(Icons.cleaning_services, "清理缓存", Colors.grey, _clearCache),
+                ],
+              ),
+              const SizedBox(height: 20),
+              const Text("运行日志", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              Container(
+                height: 150,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: Colors.grey[100], borderRadius: BorderRadius.circular(10)),
+                child: ListView.builder(
+                  itemCount: _logs.length,
+                  itemBuilder: (ctx, i) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text(_logs[i], style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                  ),
+                ),
+              ),
+              SizedBox(height: MediaQuery.of(context).viewInsets.bottom), // 键盘避让
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
-        if (!(await DbHelper.isUploaded(assetId))) {
-          String localThumb = '${appDir.path}/thumb_$assetId.jpg';
-          try {
-            await service.downloadFile("MyPhotos/.thumbs/$fileName", localThumb);
-            syncCount++;
-          } catch (_) {}
+  Widget _buildTextField(TextEditingController ctrl, String label, IconData icon, {bool isObscure = false}) {
+    return TextField(
+      controller: ctrl,
+      obscureText: isObscure,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon, color: Colors.blueGrey),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        filled: true,
+        fillColor: Colors.grey[50],
+      ),
+    );
+  }
 
-          await DbHelper.markAsUploaded(
-            assetId, 
-            thumbPath: localThumb, 
-            time: DateTime.now().millisecondsSinceEpoch,
-            filename: fileName 
-          );
-        }
-      }
-      addLog("✅ 同步完成！拉回 $syncCount 条记录");
-      await _refreshGallery(); 
-    } catch (e) {
-      addLog("❌ 同步失败: $e");
-    } finally {
-      setState(() => isRunning = false);
-    }
+  Widget _buildActionButton(IconData icon, String label, Color color, VoidCallback onTap) {
+    return InkWell(
+      onTap: () {
+        Navigator.pop(context); // 点击后关闭面板
+        onTap();
+      },
+      child: Column(
+        children: [
+          CircleAvatar(radius: 25, backgroundColor: color.withOpacity(0.1), child: Icon(icon, color: color)),
+          const SizedBox(height: 5),
+          Text(label, style: const TextStyle(fontSize: 12)),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("云相册 (融合版)")),
-      body: Column(
-        children: [
-          ExpansionTile(
-            title: const Text("配置 & 操作"),
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(children: [
-                  TextField(controller: _urlCtrl, decoration: const InputDecoration(labelText: "服务器")),
-                  TextField(controller: _userCtrl, decoration: const InputDecoration(labelText: "账号")),
-                  TextField(controller: _passCtrl, decoration: const InputDecoration(labelText: "密码"), obscureText: true),
-                  const SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      ElevatedButton(onPressed: isRunning ? null : doBackup, child: const Text("备份相册")),
-                      ElevatedButton(onPressed: isRunning ? null : syncFromCloud, child: const Text("换机同步")),
-                    ],
-                  ),
-                  Container(height: 60, color: Colors.black12, child: SingleChildScrollView(child: Text(log, style: const TextStyle(fontSize: 10)))),
-                ]),
+      backgroundColor: Colors.white,
+      // 悬浮按钮：备份
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: isRunning ? null : doBackup,
+        icon: isRunning 
+            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+            : const Icon(Icons.cloud_upload),
+        label: Text(isRunning ? "正在同步..." : "开始备份"),
+        backgroundColor: isRunning ? Colors.grey : Colors.blueAccent,
+        elevation: 4,
+      ),
+      body: CustomScrollView(
+        physics: const BouncingScrollPhysics(),
+        slivers: [
+          // 1. 沉浸式标题栏
+          SliverAppBar(
+            expandedHeight: 120.0,
+            floating: true,
+            pinned: true,
+            backgroundColor: Colors.white,
+            elevation: 0,
+            flexibleSpace: FlexibleSpaceBar(
+              titlePadding: const EdgeInsets.only(left: 16, bottom: 16),
+              title: const Text(
+                "TimeAlbum", 
+                style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)
+              ),
+              background: Container(color: Colors.white),
+            ),
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.settings, color: Colors.black87),
+                onPressed: _showSettingsPanel, // 点击打开设置面板
               ),
             ],
           ),
-          Expanded(
-            child: _displayItems.isEmpty 
-              ? const Center(child: Text("暂无照片，请尝试备份或同步"))
-              : GestureDetector(
-                  onScaleStart: (details) {
-                    _startColCount = _crossAxisCount; // 记录起始列数
-                  },
-                  onScaleUpdate: (details) {
-                    // 比例计算法：起始列数 / 缩放比例，并四舍五入
-                    // clamp(2, 6) 确保列数在 2 到 6 之间
-                    final newCount = (_startColCount / details.scale).round().clamp(2, 6);
-                    if (newCount != _crossAxisCount) {
-                      setState(() {
-                        _crossAxisCount = newCount;
-                      });
-                    }
-                  },
-                  child: GridView.builder(
-                    physics: const BouncingScrollPhysics(), // 避免手势冲突
-                    padding: const EdgeInsets.all(4),
-                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: _crossAxisCount, 
-                      crossAxisSpacing: 4, 
-                      mainAxisSpacing: 4
-                    ),
-                    itemCount: _displayItems.length,
-                    itemBuilder: (context, index) {
-                      final item = _displayItems[index];
-                      return GestureDetector(
-                        onTap: () {
-                          final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
-                          Navigator.push(context, MaterialPageRoute(builder: (_) => PhotoViewer(
-                            galleryItems: _displayItems,
-                            initialIndex: index,
-                            service: service,
-                          )));
-                        },
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            Builder(builder: (context) {
-                              if (item.asset != null) {
-                                return FutureBuilder<Uint8List?>(
-                                  future: item.asset!.thumbnailDataWithSize(const ThumbnailSize(200, 200)),
-                                  builder: (_, s) => s.hasData ? Image.memory(s.data!, fit: BoxFit.cover) : Container(color: Colors.grey[200]),
-                                );
-                              } 
-                              else if (item.localThumbPath != null && File(item.localThumbPath!).existsSync()) {
-                                return Image.file(File(item.localThumbPath!), fit: BoxFit.cover);
-                              }
-                              return Container(color: Colors.grey[300], child: const Icon(Icons.cloud_download));
-                            }),
-                            if (item.isBackedUp)
-                              const Positioned(right: 4, top: 4, child: Icon(Icons.cloud_done, color: Colors.green, size: 20)),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
+          
+          // 2. 照片内容
+          if (_groupedItems.isEmpty)
+            const SliverFillRemaining(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.photo_library_outlined, size: 64, color: Colors.grey),
+                    SizedBox(height: 10),
+                    Text("暂无照片，请点击右下角备份", style: TextStyle(color: Colors.grey)),
+                  ],
                 ),
-          ),
+              ),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.only(bottom: 80), // 底部留白给FAB
+              sliver: SliverList(
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                    final entry = _groupedItems.entries.elementAt(index);
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // 日期标题
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 20, 16, 10),
+                          child: Text(
+                            entry.key, 
+                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        // 照片网格
+                        GridView.builder(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          shrinkWrap: true, // 关键：让GridView在SliverList里自适应高度
+                          physics: const NeverScrollableScrollPhysics(), // 禁止内部滚动
+                          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: _crossAxisCount,
+                            crossAxisSpacing: 6,
+                            mainAxisSpacing: 6,
+                          ),
+                          itemCount: entry.value.length,
+                          itemBuilder: (_, i) => _buildPhotoTile(entry.value[i], entry.value, i),
+                        ),
+                      ],
+                    );
+                  },
+                  childCount: _groupedItems.length,
+                ),
+              ),
+            ),
         ],
       ),
     );
+  }
+
+  Widget _buildPhotoTile(PhotoItem item, List<PhotoItem> groupList, int index) {
+    return GestureDetector(
+      onTap: () {
+        final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
+        Navigator.push(context, MaterialPageRoute(builder: (_) => PhotoViewer(
+          galleryItems: groupList, 
+          initialIndex: index,
+          service: service
+        )));
+      },
+      child: ClipRRect( // 圆角效果
+        borderRadius: BorderRadius.circular(8),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            SmartThumbnail(
+              item: item, 
+              service: WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text)
+            ),
+            // 云端状态图标优化
+            if (item.isBackedUp)
+              Positioned(
+                right: 4, 
+                top: 4, 
+                child: Container(
+                  padding: const EdgeInsets.all(2),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.3), // 半透明背景
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.cloud_done, color: Colors.white, size: 16),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// SmartThumbnail 组件保持不变，这里省略，请保留原有的 SmartThumbnail 代码
+class SmartThumbnail extends StatefulWidget {
+  final PhotoItem item;
+  final WebDavService service;
+  const SmartThumbnail({super.key, required this.item, required this.service});
+  @override
+  State<SmartThumbnail> createState() => _SmartThumbnailState();
+}
+
+class _SmartThumbnailState extends State<SmartThumbnail> {
+  File? _imageFile;
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkAndLoad();
+  }
+
+  Future<void> _checkAndLoad() async {
+    if (widget.item.asset != null) return;
+    final appDir = await getApplicationDocumentsDirectory();
+    final targetPath = '${appDir.path}/thumb_${widget.item.id}.jpg';
+    final file = File(targetPath);
+    if (file.existsSync()) {
+      if (mounted) setState(() => _imageFile = file);
+      return;
+    }
+    if (mounted) setState(() => _isLoading = true);
+    try {
+      String remoteName = widget.item.remoteFileName ?? "${widget.item.id}.jpg";
+      if (!remoteName.contains('.')) remoteName += ".jpg";
+      await widget.service.downloadFile("MyPhotos/.thumbs/$remoteName", targetPath);
+      await DbHelper.markAsUploaded(widget.item.id, thumbPath: targetPath, time: widget.item.createTime, filename: widget.item.remoteFileName);
+      if (mounted) setState(() { _imageFile = File(targetPath); _isLoading = false; });
+    } catch (e) {
+      if (mounted) setState(() { _isLoading = false; });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.item.asset != null) {
+      return FutureBuilder<Uint8List?>(
+        future: widget.item.asset!.thumbnailDataWithSize(const ThumbnailSize(200, 200)),
+        builder: (_, s) => s.hasData ? Image.memory(s.data!, fit: BoxFit.cover) : Container(color: Colors.grey[200]),
+      );
+    }
+    if (_imageFile != null) return Image.file(_imageFile!, fit: BoxFit.cover);
+    if (_isLoading) return Container(color: Colors.grey[200], child: const Center(child: SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2))));
+    return Container(color: Colors.grey[300], child: const Icon(Icons.cloud_download, color: Colors.white));
   }
 }
