@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // ✅ 新增：用于震动反馈
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -26,9 +27,14 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
   final List<String> _logs = [];
   bool isRunning = false;
   Map<String, List<PhotoItem>> _groupedItems = {}; 
-  int _crossAxisCount = 3; 
-  int _startColCount = 3; 
   final Set<String> _sessionUploadedIds = {};
+
+  // --- 🖐️ 缩放相关状态变量 ---
+  int _crossAxisCount = 3; // 当前列数
+  double _scale = 1.0;     // 当前视觉缩放比例
+  int _pointerCount = 0;   // 屏幕上手指数量
+  final int _minColumns = 2; 
+  final int _maxColumns = 6;
 
   @override
   void initState() {
@@ -85,7 +91,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     } catch (_) {}
   }
 
-  // --- 核心逻辑：刷新相册列表（合并本地与云端记录） ---
   Future<void> _refreshGallery() async {
     // 1. 获取本地
     final albums = await PhotoManager.getAssetPathList(type: RequestType.image);
@@ -97,14 +102,14 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     
     Map<String, PhotoItem> mergedMap = {};
 
-    // A. 处理数据库记录（包含本地已删云端还在的）
+    // A. 处理数据库记录
     for (var row in dbRecords) {
       String id = row['asset_id'];
       AssetEntity? localAsset = localAssetMap[id];
       
       mergedMap[id] = PhotoItem(
         id: id,
-        asset: localAsset, // 如果本地已删，这里是 null
+        asset: localAsset, 
         localThumbPath: row['thumbnail_path'], 
         remoteFileName: row['filename'], 
         createTime: row['create_time'] ?? 0, 
@@ -112,7 +117,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       );
     }
 
-    // B. 处理本地新增未备份的
+    // B. 处理本地新增
     for (var asset in localAssets) {
       if (!mergedMap.containsKey(asset.id)) {
         mergedMap[asset.id] = PhotoItem(
@@ -134,12 +139,10 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     if (mounted) setState(() => _groupedItems = groups);
   }
 
-  // --- 核心逻辑：同步云端文件到本地数据库 ---
   Future<void> _syncCloudToLocal() async {
     if (isRunning) return;
     try {
       final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
-      
       addLog("检查云端文件...");
       List<String> cloudFiles = await service.listRemoteFiles("MyPhotos/");
       if (cloudFiles.isEmpty) return;
@@ -153,7 +156,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       for (String fileName in cloudFiles) {
         if (!localKnownFiles.contains(fileName)) {
           hasNewData = true;
-          // 生成虚拟ID
           String virtualId = "cloud_${fileName.hashCode}";
           String thumbLocalPath = '${appDir.path}/thumb_$virtualId.jpg';
           File thumbFile = File(thumbLocalPath);
@@ -184,13 +186,11 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     }
   }
 
-  // --- 核心逻辑：执行备份（含权限修复） ---
   Future<void> doBackup({bool silent = false}) async {
     if (isRunning) return;
     setState(() => isRunning = true);
     await _saveConfig();
     try {
-      // 1. 权限检查
       bool hasPermission = false;
       if (Platform.isAndroid) {
         final ps = await PhotoManager.requestPermissionExtend();
@@ -217,7 +217,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
         return;
       }
 
-      // 2. 开始备份
       final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
       await service.ensureFolder("MyPhotos/");
       await service.ensureFolder("MyPhotos/.thumbs/");
@@ -232,14 +231,13 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
           if (await DbHelper.isUploaded(asset.id)) continue;
           
           File? file = await asset.file;
-          if (file == null) continue; // iCloud 未下载或异常
+          if (file == null) continue; 
           
           String fileName = p.basename(file.path);
           addLog("上传: $fileName");
           
           await service.upload(file, "MyPhotos/$fileName");
           
-          // 生成并上传缩略图
           final thumbData = await asset.thumbnailDataWithSize(const ThumbnailSize(300, 300));
           String? localThumbPath;
           if (thumbData != null) {
@@ -264,6 +262,37 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     }
   }
 
+  // --- 🧠 缩放手势结束处理逻辑 ---
+  void _handleScaleEnd() {
+    // 只有两指以上操作才触发布局改变，防止误触
+    if (_pointerCount < 2 && _scale == 1.0) return;
+
+    int newCount = _crossAxisCount;
+
+    // 放大 -> 列数变少 (看起来图大了)
+    if (_scale > 1.2) {
+      newCount--; 
+    } 
+    // 缩小 -> 列数变多 (看起来图小了)
+    else if (_scale < 0.8) {
+      newCount++; 
+    }
+
+    // 限制范围
+    newCount = newCount.clamp(_minColumns, _maxColumns);
+
+    // 如果布局真的变了，震动一下
+    if (newCount != _crossAxisCount) {
+      HapticFeedback.mediumImpact();
+    }
+
+    setState(() {
+      _crossAxisCount = newCount;
+      _scale = 1.0; // 恢复缩放比例，实现"Snap"效果
+    });
+  }
+
+  // --- UI 构建 ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -273,37 +302,53 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
         backgroundColor: isRunning ? Colors.grey : Colors.blueAccent,
         child: isRunning ? const CircularProgressIndicator(color: Colors.white) : const Icon(Icons.cloud_upload),
       ),
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onScaleStart: (_) => _startColCount = _crossAxisCount,
-        onScaleUpdate: (d) {
-          if (d.pointerCount >= 2) {
-            final newCount = (_startColCount / d.scale).round().clamp(2, 6);
-            if (newCount != _crossAxisCount) setState(() => _crossAxisCount = newCount);
-          }
-        },
-        child: CustomScrollView(
-          physics: const BouncingScrollPhysics(),
-          slivers: [
-            SliverAppBar(
-              pinned: true, floating: true, expandedHeight: 80,
-              backgroundColor: Colors.white,
-              flexibleSpace: const FlexibleSpaceBar(title: Text("云相册", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold))),
-              actions: [
-                IconButton(icon: const Icon(Icons.refresh, color: Colors.black87), onPressed: _syncCloudToLocal),
-                IconButton(icon: const Icon(Icons.settings, color: Colors.black87), onPressed: _showSettingsPanel)
+      // 1. 最外层：Listener 负责数手指
+      body: Listener(
+        onPointerDown: (_) => setState(() => _pointerCount++),
+        onPointerUp: (_) => setState(() => _pointerCount--),
+        onPointerCancel: (_) => setState(() => _pointerCount = 0),
+        child: GestureDetector(
+          // 2. GestureDetector 负责识别缩放手势
+          onScaleUpdate: (details) {
+            if (_pointerCount >= 2) {
+              setState(() {
+                // 限制视觉缩放范围，防止无限放大/缩小
+                _scale = details.scale.clamp(0.5, 2.0);
+              });
+            }
+          },
+          onScaleEnd: (details) => _handleScaleEnd(),
+          // 3. 视觉变换层
+          child: Transform.scale(
+            scale: _scale,
+            alignment: Alignment.center, // 从中心缩放
+            child: CustomScrollView(
+              // 4. 核心逻辑：有手指且在缩放时，禁止列表滚动，让手势完全交给 GestureDetector
+              physics: (_pointerCount >= 2 || _scale != 1.0) 
+                  ? const NeverScrollableScrollPhysics() 
+                  : const BouncingScrollPhysics(),
+              slivers: [
+                SliverAppBar(
+                  pinned: true, floating: true, expandedHeight: 80,
+                  backgroundColor: Colors.white,
+                  flexibleSpace: const FlexibleSpaceBar(title: Text("云相册", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold))),
+                  actions: [
+                    IconButton(icon: const Icon(Icons.refresh, color: Colors.black87), onPressed: _syncCloudToLocal),
+                    IconButton(icon: const Icon(Icons.settings, color: Colors.black87), onPressed: _showSettingsPanel)
+                  ],
+                ),
+                SliverToBoxAdapter(
+                   child: Container(
+                     height: 30, 
+                     padding: const EdgeInsets.symmetric(horizontal: 16),
+                     child: Text(_logs.isNotEmpty ? _logs.first : "准备就绪", style: const TextStyle(color: Colors.grey, fontSize: 12))
+                   )
+                ),
+                ..._buildSliverContent(),
+                const SliverToBoxAdapter(child: SizedBox(height: 100)),
               ],
             ),
-            SliverToBoxAdapter(
-               child: Container(
-                 height: 30, 
-                 padding: const EdgeInsets.symmetric(horizontal: 16),
-                 child: Text(_logs.isNotEmpty ? _logs.first : "准备就绪", style: const TextStyle(color: Colors.grey, fontSize: 12))
-               )
-            ),
-            ..._buildSliverContent(),
-            const SliverToBoxAdapter(child: SizedBox(height: 100)),
-          ],
+          ),
         ),
       ),
     );
@@ -316,6 +361,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       slivers.add(SliverPadding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         sliver: SliverGrid(
+          // 使用动态的 _crossAxisCount
           gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: _crossAxisCount, crossAxisSpacing: 4, mainAxisSpacing: 4),
           delegate: SliverChildBuilderDelegate((_, i) => _buildPhotoTile(items[i], items, i), childCount: items.length),
         ),
