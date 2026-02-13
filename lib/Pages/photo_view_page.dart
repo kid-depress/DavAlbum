@@ -78,33 +78,29 @@ class _PhotoViewerState extends State<PhotoViewer> {
   }
 
   Future<File?> _getBestImage(PhotoItem item) async {
-    // 1. 如果本地相册里有，直接返回 (Asset)
+    // 1. 如果本地相册有，直接返回
     if (item.asset != null) {
       final file = await item.asset!.file;
       if (file != null && file.existsSync()) return file;
     }
 
-    // 2. 如果是本地已删（只有数据库记录），或者 asset.file 拿不到
-    // 检查本地缓存
+    // 2. 如果本地已删，尝试找缓存
     final appDir = await getTemporaryDirectory();
-    // 使用 remoteFileName 或者 id 来做缓存文件名
     String fileName = item.remoteFileName ?? "${item.id}.jpg";
     if (!fileName.contains('.')) fileName += ".jpg";
     
     final localPath = '${appDir.path}/temp_full_$fileName';
     final file = File(localPath);
 
-    // 3. 如果本地缓存有，直接用
     if (file.existsSync() && file.lengthSync() > 0) {
       return file;
     }
 
-    // 4. 本地完全没有，开始下载
+    // 3. 缓存没有，下载
     try {
       await widget.service.downloadFile("MyPhotos/$fileName", localPath);
       return file;
     } catch (e) {
-      print("Download error: $e");
       return null;
     }
   }

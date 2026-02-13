@@ -23,7 +23,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
   final _userCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
   
-  // 修复建议：改为 final，因为引用并没有变，只是内容变了
   final List<String> _logs = [];
   bool isRunning = false;
   Map<String, List<PhotoItem>> _groupedItems = {}; 
@@ -53,7 +52,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     doBackup(silent: true);
   }
 
-  // 修复警告：添加返回类型 Future<void>
   Future<void> _loadConfig() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
@@ -63,7 +61,6 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     });
   }
 
-  // 修复警告：添加返回类型 Future<void>
   Future<void> _saveConfig() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('url', _urlCtrl.text);
@@ -76,13 +73,11 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       final appDir = await getTemporaryDirectory();
       final files = appDir.listSync().whereType<File>().where((f) => p.basename(f.path).startsWith('temp_full_')).toList();
       int totalSize = 0;
-      // 修复警告：for循环必须加花括号
       for (var f in files) {
         totalSize += await f.length();
       }
       if (totalSize > 200 * 1024 * 1024) {
         files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()));
-        // 修复警告：for循环必须加花括号
         for (var f in files) {
           f.deleteSync();
         }
@@ -90,22 +85,26 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     } catch (_) {}
   }
 
+  // --- 核心逻辑：刷新相册列表（合并本地与云端记录） ---
   Future<void> _refreshGallery() async {
+    // 1. 获取本地
     final albums = await PhotoManager.getAssetPathList(type: RequestType.image);
     List<AssetEntity> localAssets = albums.isNotEmpty ? await albums.first.getAssetListPaged(page: 0, size: 5000) : [];
     Map<String, AssetEntity> localAssetMap = {for (var e in localAssets) e.id: e};
 
+    // 2. 获取数据库
     final dbRecords = await DbHelper.getAllRecords();
     
     Map<String, PhotoItem> mergedMap = {};
 
+    // A. 处理数据库记录（包含本地已删云端还在的）
     for (var row in dbRecords) {
       String id = row['asset_id'];
       AssetEntity? localAsset = localAssetMap[id];
       
       mergedMap[id] = PhotoItem(
         id: id,
-        asset: localAsset, 
+        asset: localAsset, // 如果本地已删，这里是 null
         localThumbPath: row['thumbnail_path'], 
         remoteFileName: row['filename'], 
         createTime: row['create_time'] ?? 0, 
@@ -113,6 +112,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       );
     }
 
+    // B. 处理本地新增未备份的
     for (var asset in localAssets) {
       if (!mergedMap.containsKey(asset.id)) {
         mergedMap[asset.id] = PhotoItem(
@@ -134,12 +134,13 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     if (mounted) setState(() => _groupedItems = groups);
   }
 
+  // --- 核心逻辑：同步云端文件到本地数据库 ---
   Future<void> _syncCloudToLocal() async {
     if (isRunning) return;
     try {
       final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
       
-      addLog("正在检查云端文件...");
+      addLog("检查云端文件...");
       List<String> cloudFiles = await service.listRemoteFiles("MyPhotos/");
       if (cloudFiles.isEmpty) return;
 
@@ -152,6 +153,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       for (String fileName in cloudFiles) {
         if (!localKnownFiles.contains(fileName)) {
           hasNewData = true;
+          // 生成虚拟ID
           String virtualId = "cloud_${fileName.hashCode}";
           String thumbLocalPath = '${appDir.path}/thumb_$virtualId.jpg';
           File thumbFile = File(thumbLocalPath);
@@ -174,7 +176,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
       }
 
       if (hasNewData) {
-        addLog("同步完成，发现云端新照片");
+        addLog("发现新照片");
         if (mounted) _refreshGallery();
       }
     } catch (e) {
@@ -182,21 +184,40 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
     }
   }
 
+  // --- 核心逻辑：执行备份（含权限修复） ---
   Future<void> doBackup({bool silent = false}) async {
     if (isRunning) return;
     setState(() => isRunning = true);
     await _saveConfig();
     try {
+      // 1. 权限检查
+      bool hasPermission = false;
       if (Platform.isAndroid) {
         final ps = await PhotoManager.requestPermissionExtend();
-        if (!ps.isAuth) {
-           addLog("没有相册权限");
-           return;
+        if (ps.isAuth) {
+          hasPermission = true;
+        } else {
+           if (!silent && mounted) {
+             showDialog(context: context, builder: (ctx) => AlertDialog(
+               title: const Text("需要权限"),
+               content: const Text("请在设置中允许访问照片权限"),
+               actions: [
+                 TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
+                 TextButton(onPressed: () { Navigator.pop(ctx); openAppSettings(); }, child: const Text("去设置")),
+               ],
+             ));
+           }
         }
       } else {
-        if (!(await Permission.photos.request().isGranted)) return;
+        if (await Permission.photos.request().isGranted || await Permission.photos.isLimited) hasPermission = true;
       }
 
+      if (!hasPermission) {
+        if (!silent) addLog("无权限");
+        return;
+      }
+
+      // 2. 开始备份
       final service = WebDavService(url: _urlCtrl.text, user: _userCtrl.text, pass: _passCtrl.text);
       await service.ensureFolder("MyPhotos/");
       await service.ensureFolder("MyPhotos/.thumbs/");
@@ -211,13 +232,14 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
           if (await DbHelper.isUploaded(asset.id)) continue;
           
           File? file = await asset.file;
-          if (file == null) continue;
+          if (file == null) continue; // iCloud 未下载或异常
           
           String fileName = p.basename(file.path);
-          addLog("正在上传: $fileName");
+          addLog("上传: $fileName");
           
           await service.upload(file, "MyPhotos/$fileName");
           
+          // 生成并上传缩略图
           final thumbData = await asset.thumbnailDataWithSize(const ThumbnailSize(300, 300));
           String? localThumbPath;
           if (thumbData != null) {
@@ -233,7 +255,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
         if (count > 0) addLog("备份完成: $count 张");
       }
     } catch (e) {
-      addLog("备份错误: $e");
+      addLog("错误: $e");
     } finally { 
       if (mounted) {
         setState(() => isRunning = false); 
@@ -319,7 +341,7 @@ class _SuperBackupPageState extends State<SuperBackupPage> {
 
   void _showSettingsPanel() {
     showModalBottomSheet(context: context, isScrollControlled: true, builder: (_) => Padding(padding: EdgeInsets.fromLTRB(20, 20, 20, MediaQuery.of(context).viewInsets.bottom + 20), child: Column(mainAxisSize: MainAxisSize.min, children: [
-      TextField(controller: _urlCtrl, decoration: const InputDecoration(labelText: "WebDAV URL (例如: https://dav.jianguoyun.com/dav/)")),
+      TextField(controller: _urlCtrl, decoration: const InputDecoration(labelText: "WebDAV URL (如: https://dav.jianguoyun.com/dav/)")),
       TextField(controller: _userCtrl, decoration: const InputDecoration(labelText: "账号")),
       TextField(controller: _passCtrl, decoration: const InputDecoration(labelText: "密码"), obscureText: true),
       const SizedBox(height: 20),
