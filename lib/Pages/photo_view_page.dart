@@ -4,12 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/photo_item.dart';
-import '../services/webdav_service.dart';
+import '../services/storage_service.dart';
 
 class PhotoViewer extends StatefulWidget {
   final List<PhotoItem> galleryItems;
   final int initialIndex;
-  final WebDavService service;
+  final StorageService service;
 
   const PhotoViewer({
     super.key,
@@ -67,10 +67,7 @@ class _PhotoViewerState extends State<PhotoViewer> {
               children: [
                 CircularProgressIndicator(color: Colors.white),
                 SizedBox(height: 10),
-                Text(
-                  "正在加载原图...",
-                  style: TextStyle(color: Colors.white70),
-                ),
+                Text("正在加载原图...", style: TextStyle(color: Colors.white70)),
               ],
             );
           }
@@ -107,7 +104,8 @@ class _PhotoViewerState extends State<PhotoViewer> {
       fileName += ".jpg";
     }
 
-    final localPath = '${tempDir.path}/temp_full_$fileName';
+    final localPath =
+        '${tempDir.path}/temp_full_${widget.service.cacheKey}_${Uri.encodeComponent(fileName)}';
     final file = File(localPath);
 
     if (file.existsSync() && file.lengthSync() > 0) {

@@ -1,14 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/photo_item.dart';
-import '../services/webdav_service.dart';
+import '../services/storage_service.dart';
 import '../widgets/smart_thumbnail.dart';
 
 class PhotoTile extends StatelessWidget {
   final PhotoItem item;
   final bool isSelectionMode;
   final bool isSelected;
-  final WebDavService service;
+  final StorageService service;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
@@ -65,7 +65,9 @@ class PhotoTile extends StatelessWidget {
                 child: Container(
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: isSelected ? theme.colorScheme.primary : Colors.black26,
+                    color: isSelected
+                        ? theme.colorScheme.primary
+                        : Colors.black26,
                     border: Border.all(color: Colors.white, width: 1.5),
                   ),
                   child: const Padding(
@@ -83,7 +85,9 @@ class PhotoTile extends StatelessWidget {
                 child: Container(
                   padding: const EdgeInsets.all(4),
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.primaryContainer.withValues(alpha: 0.8),
+                    color: theme.colorScheme.primaryContainer.withValues(
+                      alpha: 0.8,
+                    ),
                     shape: BoxShape.circle,
                   ),
                   child: Icon(

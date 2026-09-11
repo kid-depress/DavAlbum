@@ -9,14 +9,82 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/photo_item.dart';
 import '../services/db_helper.dart';
 import '../services/webdav_service.dart';
+import '../services/storage_service.dart';
+import '../services/s3_service.dart';
 
 mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   final urlCtrl = TextEditingController();
   final userCtrl = TextEditingController();
   final passCtrl = TextEditingController();
 
+  String syncProvider = 'webdav';
+  bool s3PathStyle = true;
+  final s3Controllers = <String, TextEditingController>{
+    for (final name in [
+      'endpoint',
+      'region',
+      'bucket',
+      'accessKey',
+      'secretKey',
+      'sessionToken',
+    ])
+      name: TextEditingController(text: name == 'region' ? 'us-east-1' : ''),
+  };
+
+  StorageService createStorageService() {
+    if (syncProvider == 's3') {
+      return S3Service(
+        endpoint: s3Controllers['endpoint']!.text.trim(),
+        region: s3Controllers['region']!.text.trim(),
+        bucket: s3Controllers['bucket']!.text.trim(),
+        accessKey: s3Controllers['accessKey']!.text.trim(),
+        secretKey: s3Controllers['secretKey']!.text,
+        sessionToken: s3Controllers['sessionToken']!.text.trim(),
+        pathStyle: s3PathStyle,
+      );
+    }
+    return WebDavService(
+      url: urlCtrl.text.trim(),
+      user: userCtrl.text,
+      pass: passCtrl.text,
+    );
+  }
+
+  bool get hasStorageConfig => syncProvider == 's3'
+      ? [
+          'endpoint',
+          'region',
+          'bucket',
+          'accessKey',
+          'secretKey',
+        ].every((key) => s3Controllers[key]!.text.trim().isNotEmpty)
+      : urlCtrl.text.trim().isNotEmpty;
+
+  Future<void> applyStorageSettings(String provider, bool pathStyle) async {
+    if (isRunning) return;
+    setState(() {
+      isRunning = true;
+      syncProvider = provider;
+      s3PathStyle = pathStyle;
+      groupedItems = {};
+      selectedIds.clear();
+      sessionUploadedIds.clear();
+      isSelectionMode = false;
+    });
+    try {
+      await DbHelper.useStorage(
+        syncProvider == 's3' ? createStorageService().cacheKey : '',
+      );
+      await saveConfig();
+      await refreshGallery();
+    } finally {
+      if (mounted) setState(() => isRunning = false);
+    }
+    if (mounted) await connectAndRestoreThenBackup();
+  }
+
   final List<String> logs = [];
-  bool isRunning = false;
+  bool isRunning = true;
   Map<String, List<PhotoItem>> groupedItems = {};
   final Set<String> sessionUploadedIds = {};
 
@@ -32,6 +100,9 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     urlCtrl.dispose();
     userCtrl.dispose();
     passCtrl.dispose();
+    for (final controller in s3Controllers.values) {
+      controller.dispose();
+    }
     super.dispose();
   }
 
@@ -49,9 +120,13 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   }
 
   Future<void> _startAutoTasks() async {
-    await loadConfig();
-    await refreshGallery();
-    if (urlCtrl.text.isEmpty) return;
+    try {
+      await loadConfig();
+      await refreshGallery();
+    } finally {
+      if (mounted) setState(() => isRunning = false);
+    }
+    if (!mounted || !hasStorageConfig) return;
     await _manageCache();
     await syncCloudToLocal();
     await doBackup(silent: true);
@@ -59,27 +134,43 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
 
   Future<void> connectAndRestoreThenBackup({bool silent = false}) async {
     await saveConfig();
-    await syncCloudToLocal(showBusy: true);
+    await syncCloudToLocal();
     await doBackup(silent: silent);
   }
 
   Future<void> saveConfigAndRestore() async {
+    if (isRunning) return;
     await saveConfig();
-    await syncCloudToLocal(showBusy: true);
+    await syncCloudToLocal();
   }
 
   Future<void> loadConfig() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
     setState(() {
+      syncProvider = prefs.getString('syncProvider') ?? 'webdav';
+      s3PathStyle = prefs.getBool('s3PathStyle') ?? true;
+      for (final entry in s3Controllers.entries) {
+        entry.value.text =
+            prefs.getString('s3_${entry.key}') ??
+            (entry.key == 'region' ? 'us-east-1' : '');
+      }
       urlCtrl.text = prefs.getString('url') ?? "";
       userCtrl.text = prefs.getString('user') ?? "";
       passCtrl.text = prefs.getString('pass') ?? "";
     });
+    await DbHelper.useStorage(
+      syncProvider == 's3' ? createStorageService().cacheKey : '',
+    );
   }
 
   Future<void> saveConfig() async {
     final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('syncProvider', syncProvider);
+    await prefs.setBool('s3PathStyle', s3PathStyle);
+    for (final entry in s3Controllers.entries) {
+      await prefs.setString('s3_${entry.key}', entry.value.text);
+    }
     await prefs.setString('url', urlCtrl.text);
     await prefs.setString('user', userCtrl.text);
     await prefs.setString('pass', passCtrl.text);
@@ -133,12 +224,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       }
     }
 
-    return assetsById.values.toList()
-      ..sort(
-        (a, b) => b.createDateTime.millisecondsSinceEpoch.compareTo(
-          a.createDateTime.millisecondsSinceEpoch,
-        ),
-      );
+    return assetsById.values.toList()..sort(
+      (a, b) => b.createDateTime.millisecondsSinceEpoch.compareTo(
+        a.createDateTime.millisecondsSinceEpoch,
+      ),
+    );
   }
 
   String _buildCloudFileName(File file, AssetEntity asset) {
@@ -151,22 +241,18 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     return "cloud_${Uri.encodeComponent(fileName)}";
   }
 
-  Future<void> syncCloudToLocal({bool showBusy = false}) async {
+  Future<void> syncCloudToLocal() async {
     if (isRunning) return;
-    if (showBusy && mounted) {
+    if (mounted) {
       setState(() => isRunning = true);
     }
     try {
-      if (urlCtrl.text.trim().isEmpty) {
-        addLog("请先配置 WebDAV 地址");
+      if (!hasStorageConfig) {
+        addLog("请先完成连接设置");
         return;
       }
 
-      final service = WebDavService(
-        url: urlCtrl.text,
-        user: userCtrl.text,
-        pass: passCtrl.text,
-      );
+      final service = createStorageService();
       final cloudFiles = await service.listRemoteFiles("MyPhotos/");
       if (cloudFiles.isEmpty) {
         await refreshGallery();
@@ -195,7 +281,8 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         }
 
         final virtualId = _buildCloudVirtualId(fileName);
-        final thumbPath = '${appDir.path}/thumb_$virtualId.jpg';
+        final thumbPath =
+            '${appDir.path}/thumb_${service.cacheKey}_$virtualId.jpg';
         final thumbFile = File(thumbPath);
 
         if (!thumbFile.existsSync()) {
@@ -217,7 +304,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     } catch (e) {
       addLog("同步云端照片失败: $e");
     } finally {
-      if (showBusy && mounted) {
+      if (mounted) {
         setState(() => isRunning = false);
       }
     }
@@ -229,18 +316,14 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     await saveConfig();
 
     try {
-      if (urlCtrl.text.trim().isEmpty) {
-        addLog("请先配置 WebDAV 地址");
+      if (!hasStorageConfig) {
+        addLog("请先完成连接设置");
         return;
       }
 
       if (!await _ensurePhotoPermission()) return;
 
-      final service = WebDavService(
-        url: urlCtrl.text,
-        user: userCtrl.text,
-        pass: passCtrl.text,
-      );
+      final service = createStorageService();
       await service.ensureFolder("MyPhotos/");
       await service.ensureFolder("MyPhotos/.thumbs/");
 
@@ -264,7 +347,8 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         final cloudFileName = _buildCloudFileName(file, asset);
         final existingRecord = filenameToRecord[cloudFileName];
 
-        if (!processedCloudFileNames.add(cloudFileName) && existingRecord == null) {
+        if (!processedCloudFileNames.add(cloudFileName) &&
+            existingRecord == null) {
           continue;
         }
 
@@ -304,8 +388,9 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
             thumbData,
             "MyPhotos/.thumbs/$cloudFileName",
           );
-          final thumbFile = File('${appDir.path}/thumb_${asset.id}.jpg')
-            ..writeAsBytesSync(thumbData);
+          final thumbFile = File(
+            '${appDir.path}/thumb_${service.cacheKey}_${Uri.encodeComponent(asset.id)}.jpg',
+          )..writeAsBytesSync(thumbData);
           thumbPath = thumbFile.path;
         }
 
@@ -342,9 +427,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       localAssets = await _loadAllImageAssets();
     }
 
-    final localAssetMap = {
-      for (final asset in localAssets) asset.id: asset,
-    };
+    final localAssetMap = {for (final asset in localAssets) asset.id: asset};
 
     final dbRecords = await DbHelper.getAllRecords();
     final mergedMap = <String, PhotoItem>{};
@@ -386,8 +469,8 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       final key = itemDay == today
           ? "今天"
           : itemDay == yesterday
-              ? "昨天"
-              : "${date.year}年${date.month}月${date.day}日";
+          ? "昨天"
+          : "${date.year}年${date.month}月${date.day}日";
       groups.putIfAbsent(key, () => []).add(item);
     }
 
@@ -423,7 +506,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   }
 
   Future<void> deleteSelectedCloud() async {
-    if (selectedIds.isEmpty) return;
+    if (isRunning || selectedIds.isEmpty) return;
 
     final confirm = await showDialog<bool>(
       context: context,
@@ -448,11 +531,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
 
     setState(() => isRunning = true);
     try {
-      final service = WebDavService(
-        url: urlCtrl.text,
-        user: userCtrl.text,
-        pass: passCtrl.text,
-      );
+      final service = createStorageService();
       final dbRecords = await DbHelper.getAllRecords();
       final idToFilename = {
         for (final row in dbRecords) row['asset_id'] as String: row['filename'],
@@ -492,6 +571,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   }
 
   Future<void> freeAllLocalSpace() async {
+    if (isRunning) return;
     final idsToDelete = <String>[];
     int count = 0;
 
@@ -505,9 +585,9 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     }
 
     if (idsToDelete.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("当前没有可释放的已备份本地照片")),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text("当前没有可释放的已备份本地照片")));
       return;
     }
 
@@ -554,7 +634,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   }
 
   Future<void> downloadSelectedToLocal() async {
-    if (selectedIds.isEmpty) return;
+    if (isRunning || selectedIds.isEmpty) return;
 
     final confirm = await showDialog<bool>(
       context: context,
@@ -589,11 +669,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         return;
       }
 
-      final service = WebDavService(
-        url: urlCtrl.text,
-        user: userCtrl.text,
-        pass: passCtrl.text,
-      );
+      final service = createStorageService();
       final dbRecords = await DbHelper.getAllRecords();
       final idToRecord = {
         for (final row in dbRecords) row['asset_id'] as String: row,

@@ -31,6 +31,8 @@ dependencies:
   flutter:
     sdk: flutter
   dio: ^5.4.0
+  crypto: ^3.0.7
+  xml: ^6.6.1
   photo_manager: ^3.0.0
   permission_handler: ^11.0.1
   path: ^1.8.3

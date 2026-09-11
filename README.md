@@ -2,7 +2,7 @@
 
 [![License](https://camo.githubusercontent.com/44e26a8116bb6f791a2574a317f5eb2c75555a92f954123353f990fbee1f28ef/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4c6963656e73652d417061636865253230322e302d7265642e737667)](https://github.com/briltec/flutter_Pokedex/blob/master/LICENSE) [![License](https://camo.githubusercontent.com/2b0f0abcb5a51eb4cc8321bd5a5e6eb16390950eaee6f9d4f2243af2facbe483/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4c6963656e73652d4d49542d7265642e737667)](https://github.com/briltec/flutter_Pokedex/blob/master/LICENSE)
 
-一个基于 Flutter 框架开发的轻量级图片备份工具，使用 WebDAV 协议实现跨平台、简洁高效的本地图片云端备份方案。
+一个基于 Flutter 框架开发的轻量级图片备份工具，使用 WebDAV 或 S3 协议实现跨平台、简洁高效的本地图片云端备份方案。
 
 ## 📸 应用截图
 
@@ -33,6 +33,20 @@
 
 1. [生成应用授权密码](https://help.jianguoyun.com/?p=2064)
 2. 点击右上角输入账号与授权密码即可
+
+### S3 同步
+
+在「连接设置」中选择 **S3**，填写 Endpoint、Region、Bucket、Access Key ID 和 Secret Access Key，然后点击「保存并开始备份」。临时凭证还需填写 Session Token。
+
+- AWS 示例：Endpoint 为 `https://s3.us-east-1.amazonaws.com`，Region 为 `us-east-1`；请按存储桶的实际区域修改。
+- S3 兼容服务：填写服务商提供的 Endpoint 和 Region。自建服务可填写包含端口的地址，例如 `http://192.168.1.10:9000`。
+- 默认启用路径式访问（`Endpoint/Bucket`）；如服务商要求虚拟主机式访问（`Bucket.Endpoint`），关闭该开关。Endpoint 不要重复包含存储桶名。
+- 存储桶需预先创建，凭证需具有 `s3:ListBucket` 及 `MyPhotos/*` 下的 `s3:GetObject`、`s3:PutObject`、`s3:DeleteObject` 权限。
+- 原图保存在 `MyPhotos/`，缩略图保存在 `MyPhotos/.thumbs/`。支持增量备份、分页同步、云端预览、下载到本地和删除云端备份。
+- S3 的备份记录按 Endpoint、Bucket 和 Access Key 隔离；切换回 WebDAV 会恢复原有 WebDAV 备份记录。切换不会搬迁或删除旧云端文件。
+- 配置沿用应用现有的本地偏好存储方式；当前未使用系统密钥库。大文件采用流式单次上传，暂不支持分片上传及断点续传。
+
+签名实现参考 [AWS Signature V4](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html)，列表分页参考 [ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)。
 
 ## 🎯 项目目标
 

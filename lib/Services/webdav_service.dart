@@ -3,8 +3,11 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'storage_service.dart';
 
-class WebDavService {
+class WebDavService implements StorageService {
+  @override
+  String get cacheKey => 'webdav';
   final String url;
   final String user;
   final String pass;
@@ -24,6 +27,7 @@ class WebDavService {
     );
   }
 
+  @override
   Future<void> ensureFolder(String folderName) async {
     final path = folderName.endsWith('/')
         ? folderName.substring(0, folderName.length - 1)
@@ -37,16 +41,14 @@ class WebDavService {
     }
   }
 
+  @override
   Future<List<String>> listRemoteFiles(String folderPath) async {
     final path = folderPath.endsWith('/') ? folderPath : '$folderPath/';
 
     try {
       final response = await _dio.request(
         path,
-        options: Options(
-          method: "PROPFIND",
-          headers: {"Depth": "1"},
-        ),
+        options: Options(method: "PROPFIND", headers: {"Depth": "1"}),
       );
 
       if (response.statusCode != 207) {
@@ -100,6 +102,7 @@ class WebDavService {
     }
   }
 
+  @override
   Future<void> upload(File file, String remotePath) async {
     final len = await file.length();
     await _dio.put(
@@ -109,6 +112,7 @@ class WebDavService {
     );
   }
 
+  @override
   Future<void> uploadBytes(Uint8List bytes, String remotePath) async {
     await _dio.put(
       remotePath,
@@ -117,10 +121,12 @@ class WebDavService {
     );
   }
 
+  @override
   Future<void> downloadFile(String remotePath, String localPath) async {
     await _dio.download(remotePath, localPath);
   }
 
+  @override
   Future<void> delete(String remotePath) async {
     await _dio.delete(remotePath);
   }

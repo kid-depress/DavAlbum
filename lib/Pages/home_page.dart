@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../services/webdav_service.dart';
 import '../widgets/photo_tile.dart';
 import '../widgets/settings_sheet.dart';
 import 'home_logic_mixin.dart';
@@ -14,8 +13,7 @@ class SuperBackupPage extends StatefulWidget {
   State<SuperBackupPage> createState() => _SuperBackupPageState();
 }
 
-class _SuperBackupPageState extends State<SuperBackupPage>
-    with HomeLogicMixin {
+class _SuperBackupPageState extends State<SuperBackupPage> with HomeLogicMixin {
   int _crossAxisCount = 4;
   double _scale = 1.0;
   int _pointerCount = 0;
@@ -26,7 +24,15 @@ class _SuperBackupPageState extends State<SuperBackupPage>
     initLogic();
   }
 
+  void _updatePointerCount(int count) {
+    final wasPinching = _pointerCount >= 2;
+    _pointerCount = count.clamp(0, 10);
+    // A single-finger scroll does not change the gallery layout.
+    if (wasPinching != (_pointerCount >= 2)) setState(() {});
+  }
+
   void _handleScaleEnd() {
+    if (_scale == 1.0) return;
     int newCount = _crossAxisCount;
     if (_scale > 1.2) {
       newCount--;
@@ -44,6 +50,7 @@ class _SuperBackupPageState extends State<SuperBackupPage>
   }
 
   void _showSettings() {
+    if (isRunning) return;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -52,7 +59,10 @@ class _SuperBackupPageState extends State<SuperBackupPage>
         urlCtrl: urlCtrl,
         userCtrl: userCtrl,
         passCtrl: passCtrl,
-        onSave: () => connectAndRestoreThenBackup(silent: false),
+        provider: syncProvider,
+        pathStyle: s3PathStyle,
+        s3Controllers: s3Controllers,
+        onSave: applyStorageSettings,
       ),
     );
   }
@@ -99,13 +109,14 @@ class _SuperBackupPageState extends State<SuperBackupPage>
             )
           : null,
       body: Listener(
-        onPointerDown: (_) => setState(() => _pointerCount++),
-        onPointerUp: (_) => setState(() => _pointerCount--),
-        onPointerCancel: (_) => setState(() => _pointerCount = 0),
+        onPointerDown: (_) => _updatePointerCount(_pointerCount + 1),
+        onPointerUp: (_) => _updatePointerCount(_pointerCount - 1),
+        onPointerCancel: (_) => _updatePointerCount(_pointerCount - 1),
         child: GestureDetector(
           onScaleUpdate: (details) {
             if (_pointerCount >= 2) {
-              setState(() => _scale = details.scale.clamp(0.5, 2.0));
+              final scale = details.scale.clamp(0.5, 2.0);
+              if (scale != _scale) setState(() => _scale = scale);
             }
           },
           onScaleEnd: (_) => _handleScaleEnd(),
@@ -204,6 +215,8 @@ class _SuperBackupPageState extends State<SuperBackupPage>
 
   List<Widget> _buildGridContent(ThemeData theme) {
     final slivers = <Widget>[];
+    final service = createStorageService();
+    final cacheKey = service.cacheKey;
     groupedItems.forEach((date, items) {
       slivers.add(
         SliverToBoxAdapter(
@@ -232,14 +245,11 @@ class _SuperBackupPageState extends State<SuperBackupPage>
             delegate: SliverChildBuilderDelegate((_, index) {
               final item = items[index];
               return PhotoTile(
+                key: ValueKey('${cacheKey}_${item.id}'),
                 item: item,
                 isSelectionMode: isSelectionMode,
                 isSelected: selectedIds.contains(item.id),
-                service: WebDavService(
-                  url: urlCtrl.text,
-                  user: userCtrl.text,
-                  pass: passCtrl.text,
-                ),
+                service: service,
                 onLongPress: () {
                   if (!isSelectionMode) {
                     setState(() {
@@ -259,11 +269,7 @@ class _SuperBackupPageState extends State<SuperBackupPage>
                         builder: (_) => PhotoViewer(
                           galleryItems: items,
                           initialIndex: index,
-                          service: WebDavService(
-                            url: urlCtrl.text,
-                            user: userCtrl.text,
-                            pass: passCtrl.text,
-                          ),
+                          service: service,
                         ),
                       ),
                     );

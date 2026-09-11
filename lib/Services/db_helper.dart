@@ -3,6 +3,17 @@ import 'package:path/path.dart';
 
 class DbHelper {
   static Database? _db;
+  static String _storageKey = '';
+
+  static Future<void> useStorage(String key) async {
+    if (_storageKey == key) return;
+    await close();
+    _storageKey = key;
+  }
+
+  static String get _databaseName => _storageKey.isEmpty
+      ? 'backup_records.db'
+      : 'backup_records_$_storageKey.db';
 
   static Future<Database> get db async {
     if (_db != null) return _db!;
@@ -11,7 +22,7 @@ class DbHelper {
   }
 
   static Future<Database> _initDb() async {
-    String path = join(await getDatabasesPath(), 'backup_records.db');
+    String path = join(await getDatabasesPath(), _databaseName);
     return await openDatabase(
       path,
       version: 3,
@@ -22,17 +33,26 @@ class DbHelper {
       },
       onUpgrade: (db, oldVersion, newVersion) {
         if (oldVersion < 2) {
-          db.execute('ALTER TABLE uploaded_assets ADD COLUMN thumbnail_path TEXT');
+          db.execute(
+            'ALTER TABLE uploaded_assets ADD COLUMN thumbnail_path TEXT',
+          );
         }
         if (oldVersion < 3) {
-          try { db.execute('ALTER TABLE uploaded_assets ADD COLUMN create_time INTEGER'); } catch (_) {}
-          try { db.execute('ALTER TABLE uploaded_assets ADD COLUMN filename TEXT'); } catch (_) {}
+          try {
+            db.execute(
+              'ALTER TABLE uploaded_assets ADD COLUMN create_time INTEGER',
+            );
+          } catch (_) {}
+          try {
+            db.execute('ALTER TABLE uploaded_assets ADD COLUMN filename TEXT');
+          } catch (_) {}
         }
       },
     );
   }
 
-  static Future<String> getDbPath() async => join(await getDatabasesPath(), 'backup_records.db');
+  static Future<String> getDbPath() async =>
+      join(await getDatabasesPath(), _databaseName);
 
   static Future<void> close() async {
     if (_db != null) {
@@ -41,13 +61,19 @@ class DbHelper {
     }
   }
 
-  static Future<void> markAsUploaded(String id, {String? thumbPath, int? time, String? filename}) async {
+  static Future<void> markAsUploaded(
+    String id, {
+    String? thumbPath,
+    int? time,
+    String? filename,
+  }) async {
     final database = await db;
-    await database.insert(
-      'uploaded_assets',
-      {'asset_id': id, 'thumbnail_path': thumbPath, 'create_time': time, 'filename': filename},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await database.insert('uploaded_assets', {
+      'asset_id': id,
+      'thumbnail_path': thumbPath,
+      'create_time': time,
+      'filename': filename,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   static Future<List<Map<String, dynamic>>> getAllRecords() async {
@@ -57,7 +83,11 @@ class DbHelper {
 
   static Future<bool> isUploaded(String id) async {
     final database = await db;
-    final List<Map<String, dynamic>> maps = await database.query('uploaded_assets', where: 'asset_id = ?', whereArgs: [id]);
+    final List<Map<String, dynamic>> maps = await database.query(
+      'uploaded_assets',
+      where: 'asset_id = ?',
+      whereArgs: [id],
+    );
     return maps.isNotEmpty;
   }
 

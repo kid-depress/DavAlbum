@@ -1,15 +1,14 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:photo_manager/photo_manager.dart';
+import 'package:photo_manager_image_provider/photo_manager_image_provider.dart';
 import '../models/photo_item.dart';
-import '../services/webdav_service.dart';
-import '../services/db_helper.dart';
+import '../services/storage_service.dart';
 
 class SmartThumbnail extends StatefulWidget {
   final PhotoItem item;
-  final WebDavService service;
+  final StorageService service;
   const SmartThumbnail({super.key, required this.item, required this.service});
 
   @override
@@ -17,6 +16,8 @@ class SmartThumbnail extends StatefulWidget {
 }
 
 class _SmartThumbnailState extends State<SmartThumbnail> {
+  static String? _documentsPath;
+  int _loadVersion = 0;
   File? _imageFile;
   bool _isLoading = false;
 
@@ -31,7 +32,9 @@ class _SmartThumbnailState extends State<SmartThumbnail> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.item.id != widget.item.id ||
         oldWidget.item.remoteFileName != widget.item.remoteFileName ||
-        oldWidget.item.asset?.id != widget.item.asset?.id) {
+        oldWidget.item.asset?.id != widget.item.asset?.id ||
+        oldWidget.item.localThumbPath != widget.item.localThumbPath ||
+        oldWidget.service.cacheKey != widget.service.cacheKey) {
       _imageFile = null;
       _isLoading = false;
       _checkAndLoad();
@@ -39,40 +42,75 @@ class _SmartThumbnailState extends State<SmartThumbnail> {
   }
 
   Future<void> _checkAndLoad() async {
-    if (widget.item.asset != null) return;
-    final appDir = await getApplicationDocumentsDirectory();
-    final targetPath = '${appDir.path}/thumb_${widget.item.id}.jpg';
-    final file = File(targetPath);
-    if (file.existsSync()) {
-      if (mounted) setState(() => _imageFile = file);
-      return;
+    final version = ++_loadVersion;
+    final item = widget.item;
+    final service = widget.service;
+    if (item.asset != null) return;
+    bool isCurrent() => mounted && version == _loadVersion;
+
+    // Resolve known disk paths synchronously so remounting a cached tile does
+    // not insert a placeholder frame before Flutter can reuse its image cache.
+    final savedPath = item.localThumbPath;
+    if (savedPath != null) {
+      final savedFile = File(savedPath);
+      if (savedFile.existsSync() && savedFile.lengthSync() > 0) {
+        _imageFile = savedFile;
+        return;
+      }
     }
-    if (mounted) setState(() => _isLoading = true);
     try {
-      String remoteName = widget.item.remoteFileName ?? "${widget.item.id}.jpg";
-      if (!remoteName.contains('.')) remoteName += ".jpg";
-      await widget.service.downloadFile("MyPhotos/.thumbs/$remoteName", targetPath);
-      await DbHelper.markAsUploaded(widget.item.id, thumbPath: targetPath, time: widget.item.createTime, filename: widget.item.remoteFileName);
-      if (mounted) setState(() { _imageFile = File(targetPath); _isLoading = false; });
-    } catch (e) {
-      if (mounted) setState(() { _isLoading = false; });
+      final directoryPath = _documentsPath ??=
+          (await getApplicationDocumentsDirectory()).path;
+      if (!isCurrent()) return;
+      final targetPath =
+          '$directoryPath/thumb_${service.cacheKey}_${Uri.encodeComponent(item.id)}.jpg';
+      final file = File(targetPath);
+      if (file.existsSync() && file.lengthSync() > 0) {
+        setState(() => _imageFile = file);
+        return;
+      }
+      setState(() => _isLoading = true);
+      String remoteName = item.remoteFileName ?? '${item.id}.jpg';
+      if (!remoteName.contains('.')) remoteName += '.jpg';
+      await service.downloadFile('MyPhotos/.thumbs/$remoteName', targetPath);
+      if (!isCurrent()) return;
+      setState(() {
+        _imageFile = file;
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (isCurrent()) setState(() => _isLoading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     if (widget.item.asset != null) {
-      return FutureBuilder<Uint8List?>(
-        future: widget.item.asset!.thumbnailDataWithSize(const ThumbnailSize(200, 200)),
-        builder: (_, s) => s.hasData ? Image.memory(s.data!, fit: BoxFit.cover) : Container(color: Colors.grey[200]),
+      return AssetEntityImage(
+        widget.item.asset!,
+        key: ValueKey(widget.item.asset!.id),
+        isOriginal: false,
+        thumbnailSize: const ThumbnailSize(200, 200),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        errorBuilder: (_, error, stackTrace) => Container(
+          color: Colors.grey[200],
+          child: const Icon(Icons.broken_image_outlined, color: Colors.grey),
+        ),
       );
     }
     if (_imageFile != null) return Image.file(_imageFile!, fit: BoxFit.cover);
     return Container(
       color: Colors.grey[200],
-      child: _isLoading 
-        ? const Center(child: SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2))) 
-        : const Icon(Icons.cloud_download, color: Colors.white),
+      child: _isLoading
+          ? const Center(
+              child: SizedBox(
+                width: 15,
+                height: 15,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          : const Icon(Icons.cloud_download, color: Colors.white),
     );
   }
 }
