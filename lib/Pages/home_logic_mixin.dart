@@ -11,6 +11,7 @@ import '../services/db_helper.dart';
 import '../services/webdav_service.dart';
 import '../services/storage_service.dart';
 import '../services/s3_service.dart';
+import '../widgets/sync_status_sheet.dart';
 
 mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   final urlCtrl = TextEditingController();
@@ -87,6 +88,9 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   bool isRunning = true;
   Map<String, List<PhotoItem>> groupedItems = {};
   final Set<String> sessionUploadedIds = {};
+  final ValueNotifier<SyncStatusSnapshot> syncStatus = ValueNotifier(
+    const SyncStatusSnapshot(isRunning: true),
+  );
 
   bool isSelectionMode = false;
   final Set<String> selectedIds = {};
@@ -103,6 +107,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     for (final controller in s3Controllers.values) {
       controller.dispose();
     }
+    syncStatus.dispose();
     super.dispose();
   }
 
@@ -117,6 +122,90 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         logs.removeLast();
       }
     });
+    syncStatus.value = syncStatus.value.copyWith(lastMessage: message);
+  }
+
+  void _updateSyncStatus({
+    bool? isConfigured,
+    bool? isConnected,
+    bool? isRunning,
+    String? currentTask,
+    int? remoteCount,
+    int? localCount,
+    int? pendingUploadCount,
+    int? pendingDownloadCount,
+    bool clearRemoteCount = false,
+  }) {
+    if (!mounted) return;
+    syncStatus.value = syncStatus.value.copyWith(
+      isConfigured: isConfigured,
+      isConnected: isConnected,
+      isRunning: isRunning,
+      currentTask: currentTask,
+      remoteCount: remoteCount,
+      localCount: localCount,
+      pendingUploadCount: pendingUploadCount,
+      pendingDownloadCount: pendingDownloadCount,
+      clearRemoteCount: clearRemoteCount,
+    );
+  }
+
+  Future<void> refreshSyncStatus() async {
+    if (!mounted || isRunning) return;
+
+    final localItems = groupedItems.values
+        .expand((items) => items)
+        .where((item) => item.asset != null)
+        .toList();
+    _updateSyncStatus(
+      isConfigured: hasStorageConfig,
+      isConnected: false,
+      isRunning: true,
+      currentTask: '正在刷新同步状态',
+      localCount: localItems.length,
+    );
+
+    if (!hasStorageConfig) {
+      _updateSyncStatus(
+        isRunning: false,
+        currentTask: '空闲',
+        clearRemoteCount: true,
+        pendingUploadCount: localItems.length,
+        pendingDownloadCount: 0,
+      );
+      return;
+    }
+
+    try {
+      final records = await DbHelper.getAllRecords();
+      final uploadedIds = records
+          .map((row) => row['asset_id'] as String)
+          .toSet();
+      final knownFileNames = records
+          .map((row) => row['filename'] as String?)
+          .whereType<String>()
+          .toSet();
+      final cloudFiles = await createStorageService().listRemoteFiles(
+        'MyPhotos/',
+      );
+
+      _updateSyncStatus(
+        isConnected: true,
+        remoteCount: cloudFiles.length,
+        localCount: localItems.length,
+        pendingUploadCount: localItems
+            .where((item) => !uploadedIds.contains(item.id))
+            .length,
+        pendingDownloadCount: cloudFiles
+            .where((fileName) => !knownFileNames.contains(fileName))
+            .length,
+      );
+    } catch (e) {
+      addLog('刷新同步状态失败: $e');
+      _updateSyncStatus(isConnected: false);
+    } finally {
+      _updateSyncStatus(isRunning: false, currentTask: '空闲');
+    }
   }
 
   Future<void> _startAutoTasks() async {
@@ -124,7 +213,14 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       await loadConfig();
       await refreshGallery();
     } finally {
-      if (mounted) setState(() => isRunning = false);
+      if (mounted) {
+        setState(() => isRunning = false);
+        _updateSyncStatus(
+          isConfigured: hasStorageConfig,
+          isRunning: false,
+          currentTask: '空闲',
+        );
+      }
     }
     if (!mounted || !hasStorageConfig) return;
     await _manageCache();
@@ -245,6 +341,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     if (isRunning) return;
     if (mounted) {
       setState(() => isRunning = true);
+      _updateSyncStatus(
+        isConfigured: hasStorageConfig,
+        isRunning: true,
+        currentTask: '正在检查云端照片',
+      );
     }
     try {
       if (!hasStorageConfig) {
@@ -254,6 +355,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
 
       final service = createStorageService();
       final cloudFiles = await service.listRemoteFiles("MyPhotos/");
+      _updateSyncStatus(
+        isConnected: true,
+        remoteCount: cloudFiles.length,
+        currentTask: '正在同步云端照片',
+      );
       if (cloudFiles.isEmpty) {
         await refreshGallery();
         addLog("云端未发现可恢复的照片");
@@ -273,6 +379,9 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
 
         hasNewData = true;
         newCount++;
+        _updateSyncStatus(
+          currentTask: '正在同步云端照片 $newCount/${cloudFiles.length}',
+        );
         int photoTime;
         try {
           photoTime = int.parse(fileName.split('_').first);
@@ -303,9 +412,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       addLog(hasNewData ? "已同步 $newCount 张云端照片" : "云端照片已是最新");
     } catch (e) {
       addLog("同步云端照片失败: $e");
+      _updateSyncStatus(isConnected: false);
     } finally {
       if (mounted) {
         setState(() => isRunning = false);
+        _updateSyncStatus(isRunning: false, currentTask: '空闲');
       }
     }
   }
@@ -313,6 +424,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
   Future<void> doBackup({bool silent = false}) async {
     if (isRunning) return;
     setState(() => isRunning = true);
+    _updateSyncStatus(
+      isConfigured: hasStorageConfig,
+      isRunning: true,
+      currentTask: '正在扫描本地照片',
+    );
     await saveConfig();
 
     try {
@@ -328,6 +444,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
       await service.ensureFolder("MyPhotos/.thumbs/");
 
       final photos = await _loadAllImageAssets();
+      _updateSyncStatus(localCount: photos.length);
       if (photos.isEmpty) return;
 
       final dbRecords = await DbHelper.getAllRecords();
@@ -335,8 +452,16 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         for (final row in dbRecords)
           if (row['filename'] != null) row['filename'] as String: row,
       };
+      final uploadedAssetIds = dbRecords
+          .map((record) => record['asset_id'] as String)
+          .toSet();
       final processedCloudFileNames = <String>{};
       final appDir = await getApplicationDocumentsDirectory();
+      var completedUploads = 0;
+      final pendingUploads = photos
+          .where((asset) => !uploadedAssetIds.contains(asset.id))
+          .length;
+      _updateSyncStatus(pendingUploadCount: pendingUploads);
       for (final asset in photos) {
         if (await DbHelper.isUploaded(asset.id)) continue;
 
@@ -377,6 +502,10 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
           addLog("正在备份: $originalName");
         }
 
+        _updateSyncStatus(
+          currentTask: '正在上传 ${completedUploads + 1}/$pendingUploads',
+        );
+
         await service.upload(file, "MyPhotos/$cloudFileName");
         final thumbData = await asset.thumbnailDataWithSize(
           const ThumbnailSize(300, 300),
@@ -408,7 +537,11 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
         };
 
         if (mounted) {
+          completedUploads++;
           setState(() => sessionUploadedIds.add(asset.id));
+          _updateSyncStatus(
+            pendingUploadCount: pendingUploads - completedUploads,
+          );
         }
       }
     } catch (e) {
@@ -416,6 +549,7 @@ mixin HomeLogicMixin<T extends StatefulWidget> on State<T> {
     } finally {
       if (mounted) {
         setState(() => isRunning = false);
+        _updateSyncStatus(isRunning: false, currentTask: '空闲');
         await refreshGallery();
       }
     }

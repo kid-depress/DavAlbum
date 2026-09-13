@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../widgets/photo_tile.dart';
 import '../widgets/settings_sheet.dart';
+import '../widgets/sync_status_sheet.dart';
 import 'home_logic_mixin.dart';
 import 'photo_view_page.dart';
 
@@ -63,6 +66,32 @@ class _SuperBackupPageState extends State<SuperBackupPage> with HomeLogicMixin {
         pathStyle: s3PathStyle,
         s3Controllers: s3Controllers,
         onSave: applyStorageSettings,
+      ),
+    );
+  }
+
+  void _showSyncStatus() {
+    unawaited(refreshSyncStatus());
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetContext) => FractionallySizedBox(
+        heightFactor: 0.72,
+        child: SyncStatusSheet(
+          providerName: syncProvider == 's3' ? 'S3' : 'WebDAV',
+          statusListenable: syncStatus,
+          onOpenSettings: () {
+            Navigator.pop(sheetContext);
+            _showSettings();
+          },
+          onRefresh: refreshSyncStatus,
+          onSync: () async {
+            await connectAndRestoreThenBackup();
+            await refreshSyncStatus();
+          },
+        ),
       ),
     );
   }
@@ -148,7 +177,8 @@ class _SuperBackupPageState extends State<SuperBackupPage> with HomeLogicMixin {
                   actions: [
                     if (!isSelectionMode) ...[
                       IconButton(
-                        onPressed: saveConfigAndRestore,
+                        tooltip: '同步状态',
+                        onPressed: _showSyncStatus,
                         icon: const Icon(Icons.sync),
                       ),
                       PopupMenuButton<String>(
